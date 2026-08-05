@@ -54,3 +54,58 @@ Example:
 
 You can view and compare benchmark results with:
 `python3 parse_bench.py <bench_file_1> <bench_file_2> <...>`
+
+## RocksDB `max_bytes_for_level_base` A/B
+
+Compares compaction write amplification on the four state CFs
+(`account_trie_nodes`, `storage_trie_nodes`, `account_flatkeyvalue`,
+`storage_flatkeyvalue`) when changing `--rocksdb.max-bytes-for-level-base`.
+
+**Primary metric:** Sum `W-Amp` / `Write(GB)` in the cfstats dump at end of
+`import-bench` (logged after a compaction settle). Do not use Int for a single
+end-of-run dump. Ggas/s from `parse_bench.py` is secondary.
+
+**Write volume:** prefer **≥5k–10k** mainnet blocks in `chain.rlp`. With ~1k
+blocks, treat results as directional only.
+
+### Example (same frozen DB copy each run)
+
+Match `benchmark.sh`: wipe the temp datadir, copy the frozen DB, then import.
+`--network mainnet` makes the effective path `$TEMP/mainnet` (ethrex migrates an
+unsuffixed copy under `$TEMP` automatically when needed). Confirm the open log
+line includes the intended `max_bytes_for_level_base`.
+
+```bash
+TEMP=~/.local/share/temp
+CHAIN=~/.local/share/ethrex_mainnet_bench/chain.rlp
+FROZEN=~/.local/share/ethrex_mainnet_bench/ethrex
+
+run_one() {
+  local level_base=$1
+  rm -rf "$TEMP"
+  cp -a "$FROZEN" "$TEMP"
+  ethrex --datadir "$TEMP" --network mainnet \
+    --rocksdb.max-bytes-for-level-base "$level_base" \
+    import-bench "$CHAIN"
+}
+
+# 256 MiB (pre-fix default behavior)
+run_one $((256*1024*1024))
+# 2 GiB (current default)
+run_one $((2*1024*1024*1024))
+# 4 GiB (Tuning Guide upper bound)
+run_one $((4*1024*1024*1024))
+```
+
+Repeat each value ≥3 times on a quiet machine with identical
+`--rocksdb.block-cache-size`. Always use a fresh frozen-DB copy per run.
+After import, wait for `RocksDB state-CF compaction settled` (or a settle
+timeout warning), then compare Sum `W-Amp` / `Write(GB)` in the four
+`rocksdb state CF compaction stats` log records.
+
+### Decision rule
+
+1. Discard a value that clearly worsens stalls or mean Ggas/s beyond noise.
+2. Prefer the lowest average state-CF **Sum** W-Amp (and compaction Write(GB)).
+3. If 2 GiB and 4 GiB are within noise, keep **2 GiB**.
+4. If 256 MiB is clearly worse, that confirms the level-base fix; do not revert.

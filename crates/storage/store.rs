@@ -100,6 +100,12 @@ fn shard_count(n: usize) -> usize {
 /// CFs) and ~8 GiB the floor where the filter set starts to thrash.
 pub const DEFAULT_ROCKSDB_BLOCK_CACHE_SIZE_BYTES: usize = 12 * 1024 * 1024 * 1024;
 
+/// Default `max_bytes_for_level_base` for RocksDB state CFs (trie + flat-KV).
+///
+/// Sized against expected L0 under memory-pressure flushes. Overridable for A/B
+/// compaction experiments via `--rocksdb.max-bytes-for-level-base`.
+pub const DEFAULT_ROCKSDB_MAX_BYTES_FOR_LEVEL_BASE: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Tunable configuration for [`Store::new_with_config`] and related constructors.
 ///
 /// Use [`StoreConfig::default()`] for production-tuned defaults; callers that
@@ -111,6 +117,10 @@ pub struct StoreConfig {
     /// the effective ceiling on RocksDB's resident memory. Ignored for
     /// in-memory backends.
     pub rocksdb_block_cache_size: usize,
+    /// `max_bytes_for_level_base` for the four state CFs (`account_trie_nodes`,
+    /// `storage_trie_nodes`, `account_flatkeyvalue`, `storage_flatkeyvalue`).
+    /// Ignored for in-memory backends.
+    pub rocksdb_max_bytes_for_level_base: u64,
     /// Bound on the persist worker's channel: number of staged (acked) live
     /// messages whose flush may still be in flight. Once full, the next send
     /// blocks — that is the backpressure that throttles `newPayload`.
@@ -122,6 +132,7 @@ impl Default for StoreConfig {
     fn default() -> Self {
         Self {
             rocksdb_block_cache_size: DEFAULT_ROCKSDB_BLOCK_CACHE_SIZE_BYTES,
+            rocksdb_max_bytes_for_level_base: DEFAULT_ROCKSDB_MAX_BYTES_FOR_LEVEL_BASE,
             persist_channel_capacity: DEFAULT_PERSIST_CHANNEL_CAPACITY,
         }
     }
@@ -423,6 +434,14 @@ pub fn tx_locations_merge(
     }
     Some(list.encode_to_vec())
 }
+
+/// State CFs used for compaction A/B of `max_bytes_for_level_base`.
+const STATE_CFS_FOR_COMPACTION_STATS: &[&str] = &[
+    ACCOUNT_TRIE_NODES,
+    STORAGE_TRIE_NODES,
+    ACCOUNT_FLATKEYVALUE,
+    STORAGE_FLATKEYVALUE,
+];
 
 impl Store {
     /// Block until the persist worker has fully processed all previously-sent
@@ -1888,7 +1907,7 @@ impl Store {
                     // `receipts`) are still readable during the migration.
                     let rocksdb = Arc::new(RocksDBBackend::open(
                         &path,
-                        config.rocksdb_block_cache_size,
+                        crate::backend::rocksdb::RocksDbOpenConfig::from_store_config(config),
                     )?);
                     crate::migrations::run_pending_migrations(rocksdb.as_ref(), &db_path, v)?;
                     rocksdb.drop_obsolete_cfs(&path);
@@ -1912,7 +1931,10 @@ impl Store {
         match engine_type {
             #[cfg(feature = "rocksdb")]
             EngineType::RocksDB => {
-                let rocksdb = RocksDBBackend::open(&path, config.rocksdb_block_cache_size)?;
+                let rocksdb = RocksDBBackend::open(
+                    &path,
+                    crate::backend::rocksdb::RocksDbOpenConfig::from_store_config(config),
+                )?;
                 rocksdb.drop_obsolete_cfs(&path);
                 let backend: Arc<dyn StorageBackend> = Arc::new(rocksdb);
                 Self::from_backend(
@@ -4115,6 +4137,72 @@ impl Store {
         Ok(())
     }
 
+    /// Sum of `rocksdb.estimate-pending-compaction-bytes` across state CFs.
+    pub fn estimate_pending_compaction_bytes_state_cfs(&self) -> u64 {
+        let mut total = 0u64;
+        for table in STATE_CFS_FOR_COMPACTION_STATS {
+            if let Some(value) = self
+                .backend
+                .property_value(table, "rocksdb.estimate-pending-compaction-bytes")
+            {
+                if let Ok(n) = value.parse::<u64>() {
+                    total = total.saturating_add(n);
+                }
+            }
+        }
+        total
+    }
+
+    /// Wait until state-CF pending compaction is drained, or until `max_wait`
+    /// elapses. Needed before reading Sum compaction stats: ethrex's
+    /// `wait_for_persistence_idle` only covers the persist worker, not RocksDB
+    /// background compaction.
+    ///
+    /// Only `pending == 0` counts as settled. A flat non-zero estimate must not
+    /// short-circuit — that would dump Sum W-Amp while compaction is still owed
+    /// and bias A/B comparisons.
+    ///
+    /// Async so import-bench does not block the Tokio runtime during the drain.
+    pub async fn wait_for_rocksdb_compaction_settle(&self, max_wait: std::time::Duration) {
+        let start = std::time::Instant::now();
+        let poll = std::time::Duration::from_secs(2);
+
+        loop {
+            let pending = self.estimate_pending_compaction_bytes_state_cfs();
+            if pending == 0 {
+                info!(pending, "RocksDB state-CF compaction settled");
+                break;
+            }
+            if start.elapsed() >= max_wait {
+                warn!(
+                    pending,
+                    waited_secs = start.elapsed().as_secs(),
+                    "RocksDB compaction settle timed out; dumping stats anyway"
+                );
+                break;
+            }
+            tokio::time::sleep(poll).await;
+        }
+    }
+
+    /// Log RocksDB compaction stats for the four state CFs (Sum W-Amp lives here).
+    pub fn log_rocksdb_state_cf_stats(&self) {
+        for table in STATE_CFS_FOR_COMPACTION_STATS {
+            let stats = self
+                .backend
+                .property_value(table, "rocksdb.cfstats")
+                .or_else(|| self.backend.property_value(table, "rocksdb.stats"));
+            match stats {
+                Some(stats) => {
+                    info!(cf = %table, stats = %stats, "rocksdb state CF compaction stats");
+                }
+                None => {
+                    info!(cf = %table, "rocksdb cfstats unavailable");
+                }
+            }
+        }
+    }
+
     pub fn get_store_directory(&self) -> Result<PathBuf, StoreError> {
         Ok(self.db_path.clone())
     }
@@ -5361,7 +5449,12 @@ pub fn read_chain_id_from_db(path: &Path) -> Option<u64> {
     {
         // The cache size is irrelevant for this one-shot chain-id read (the LRU
         // is sized as a ceiling, not pre-allocated), so we use the default.
-        let backend = match RocksDBBackend::open(path, DEFAULT_ROCKSDB_BLOCK_CACHE_SIZE_BYTES) {
+        let backend = match RocksDBBackend::open(
+            path,
+            crate::backend::rocksdb::RocksDbOpenConfig::with_block_cache_size(
+                DEFAULT_ROCKSDB_BLOCK_CACHE_SIZE_BYTES,
+            ),
+        ) {
             Ok(backend) => backend,
             Err(e) => {
                 warn!("Failed to open RocksDB at {path:?} to read chain ID: {e}");

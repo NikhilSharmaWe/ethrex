@@ -21,6 +21,30 @@ use tracing::{info, warn};
 
 use crate::store::tx_locations_merge;
 
+/// Open-time RocksDB tunables from [`crate::store::StoreConfig`].
+#[derive(Debug, Clone, Copy)]
+pub struct RocksDbOpenConfig {
+    pub block_cache_size: usize,
+    pub max_bytes_for_level_base: u64,
+}
+
+impl RocksDbOpenConfig {
+    /// Production defaults with an overridden block-cache size.
+    pub fn with_block_cache_size(block_cache_size: usize) -> Self {
+        Self {
+            block_cache_size,
+            max_bytes_for_level_base: crate::store::DEFAULT_ROCKSDB_MAX_BYTES_FOR_LEVEL_BASE,
+        }
+    }
+
+    pub fn from_store_config(config: crate::store::StoreConfig) -> Self {
+        Self {
+            block_cache_size: config.rocksdb_block_cache_size,
+            max_bytes_for_level_base: config.rocksdb_max_bytes_for_level_base,
+        }
+    }
+}
+
 /// Adapter wrapping `tx_locations_merge` to match RocksDB's expected signature.
 fn tx_locations_merge_op(
     _new_key: &[u8],
@@ -38,7 +62,7 @@ pub struct RocksDBBackend {
 }
 
 impl RocksDBBackend {
-    pub fn open(path: impl AsRef<Path>, block_cache_size: usize) -> Result<Self, StoreError> {
+    pub fn open(path: impl AsRef<Path>, config: RocksDbOpenConfig) -> Result<Self, StoreError> {
         // Rocksdb optimizations options
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -89,7 +113,12 @@ impl RocksDBBackend {
         // the size (see the `--rocksdb.block-cache-size` CLI flag); a value that is too
         // small relative to the filter + working-set size will degrade block-import
         // throughput (filter blocks displace data blocks, EVM reads spill to disk).
-        let block_cache = Cache::new_lru_cache(block_cache_size);
+        let block_cache = Cache::new_lru_cache(config.block_cache_size);
+        info!(
+            block_cache_size = config.block_cache_size,
+            max_bytes_for_level_base = config.max_bytes_for_level_base,
+            "Opening RocksDB with state-CF level-base tunables"
+        );
 
         // Configures a CF's block-based table to keep its index and bloom-filter blocks
         // inside the shared (bounded) block cache rather than pinning them per open file.
@@ -179,7 +208,8 @@ impl RocksDBBackend {
                     cf_opts.set_target_file_size_base(256 * 1024 * 1024); // 256MB
                     // Base level target ≈ expected L0 size under memory-pressure flushes
                     // (db_write_buffer_size often flushes before a full 512MB×2 merge).
-                    cf_opts.set_max_bytes_for_level_base(2 * 1024 * 1024 * 1024); // 2GB
+                    // Overridable via StoreConfig / --rocksdb.max-bytes-for-level-base.
+                    cf_opts.set_max_bytes_for_level_base(config.max_bytes_for_level_base);
                     cf_opts.set_memtable_prefix_bloom_ratio(0.2); // Bloom filter
 
                     let mut block_opts = BlockBasedOptions::default();
@@ -195,7 +225,8 @@ impl RocksDBBackend {
                     cf_opts.set_target_file_size_base(256 * 1024 * 1024); // 256MB
                     // Base level target ≈ expected L0 size under memory-pressure flushes
                     // (db_write_buffer_size often flushes before a full 512MB×2 merge).
-                    cf_opts.set_max_bytes_for_level_base(2 * 1024 * 1024 * 1024); // 2GB
+                    // Overridable via StoreConfig / --rocksdb.max-bytes-for-level-base.
+                    cf_opts.set_max_bytes_for_level_base(config.max_bytes_for_level_base);
                     cf_opts.set_memtable_prefix_bloom_ratio(0.2); // Bloom filter
 
                     let mut block_opts = BlockBasedOptions::default();
@@ -363,6 +394,11 @@ impl StorageBackend for RocksDBBackend {
         self.db
             .flush_wal(true)
             .map_err(|e| StoreError::Custom(format!("RocksDB flush_wal failed: {e}")))
+    }
+
+    fn property_value(&self, table: &str, name: &str) -> Option<String> {
+        let cf = self.db.cf_handle(table)?;
+        self.db.property_value_cf(&cf, name).ok().flatten()
     }
 }
 
@@ -584,7 +620,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend = RocksDBBackend::open(
             dir.path(),
-            crate::store::DEFAULT_ROCKSDB_BLOCK_CACHE_SIZE_BYTES,
+            RocksDbOpenConfig::with_block_cache_size(
+                crate::store::DEFAULT_ROCKSDB_BLOCK_CACHE_SIZE_BYTES,
+            ),
         )
         .unwrap();
         let cf = backend.db.cf_handle(TRANSACTION_LOCATIONS).unwrap();
@@ -624,6 +662,55 @@ mod tests {
         assert_eq!(got, want, "no entries may be dropped through compaction");
     }
 
+    /// Smoke test for the compaction A/B plumbing: custom max_bytes_for_level_base
+    /// opens, state-CF writes flush, and rocksdb.cfstats / pending-bytes are readable.
+    #[test]
+    fn state_cf_level_base_and_cfstats_smoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let max_bytes = 256 * 1024 * 1024; // 256 MiB — pre-fix default
+        let backend = RocksDBBackend::open(
+            dir.path(),
+            RocksDbOpenConfig {
+                block_cache_size: 64 * 1024 * 1024,
+                max_bytes_for_level_base: max_bytes,
+            },
+        )
+        .expect("open rocksdb");
+
+        // Write enough to account_trie_nodes to create real SST activity.
+        for i in 0..64u64 {
+            let mut tx = backend.begin_write().unwrap();
+            let key = H256::from_low_u64_be(i);
+            let val = vec![i as u8; 1024];
+            tx.put(ACCOUNT_TRIE_NODES, key.as_bytes(), &val).unwrap();
+            tx.commit().unwrap();
+        }
+        backend.flush().unwrap();
+
+        let cf = backend.db.cf_handle(ACCOUNT_TRIE_NODES).unwrap();
+        backend
+            .db
+            .compact_range_cf(&cf, None::<&[u8]>, None::<&[u8]>);
+
+        let cfstats = backend.property_value(ACCOUNT_TRIE_NODES, "rocksdb.cfstats");
+        let stats = backend.property_value(ACCOUNT_TRIE_NODES, "rocksdb.stats");
+        assert!(
+            cfstats.as_ref().is_some_and(|s| !s.is_empty())
+                || stats.as_ref().is_some_and(|s| !s.is_empty()),
+            "expected rocksdb.cfstats or rocksdb.stats for account_trie_nodes"
+        );
+
+        let pending = backend.property_value(
+            ACCOUNT_TRIE_NODES,
+            "rocksdb.estimate-pending-compaction-bytes",
+        );
+        assert!(
+            pending.is_some(),
+            "estimate-pending-compaction-bytes should be readable"
+        );
+        let _ = pending.unwrap().parse::<u64>().expect("pending bytes parse");
+    }
+
     /// Same-block_hash operands must dedupe to the latest, even across a
     /// flush+compaction boundary.
     #[test]
@@ -631,7 +718,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let backend = RocksDBBackend::open(
             dir.path(),
-            crate::store::DEFAULT_ROCKSDB_BLOCK_CACHE_SIZE_BYTES,
+            RocksDbOpenConfig::with_block_cache_size(
+                crate::store::DEFAULT_ROCKSDB_BLOCK_CACHE_SIZE_BYTES,
+            ),
         )
         .unwrap();
         let cf = backend.db.cf_handle(TRANSACTION_LOCATIONS).unwrap();

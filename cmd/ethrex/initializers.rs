@@ -753,6 +753,7 @@ pub async fn init_l1(
 
     let store_config = StoreConfig {
         rocksdb_block_cache_size: opts.rocksdb_block_cache_size,
+        rocksdb_max_bytes_for_level_base: opts.rocksdb_max_bytes_for_level_base,
         ..StoreConfig::default()
     };
     let store_result = if opts.skip_genesis_validation {

@@ -58,6 +58,12 @@ pub trait StorageBackend: Debug + Send + Sync {
     fn flush(&self) -> Result<(), StoreError> {
         Ok(())
     }
+
+    /// Reads a backend property for `table` (e.g. RocksDB CF property).
+    /// Returns `None` when unsupported or unavailable.
+    fn property_value(&self, _table: &str, _name: &str) -> Option<String> {
+        None
+    }
 }
 
 /// Read-only transaction interface.

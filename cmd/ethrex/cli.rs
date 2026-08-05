@@ -20,13 +20,14 @@ use ethrex_p2p::{
     tx_broadcaster::BROADCAST_INTERVAL_MS, types::Node,
 };
 use ethrex_rlp::encode::RLPEncode;
-use ethrex_storage::{DB_COMMIT_THRESHOLD, error::StoreError, has_valid_db};
+use ethrex_storage::{DB_COMMIT_THRESHOLD, StoreConfig, error::StoreError, has_valid_db};
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, error, info, warn};
 
 use crate::{
     initializers::{
-        get_network, init_blockchain, init_store, init_tracing, load_store, regenerate_head_state,
+        get_network, init_blockchain, init_store, init_store_with_config, init_tracing, load_store,
+        regenerate_head_state,
     },
     utils::{
         self, default_datadir, get_client_version, get_client_version_string,
@@ -120,6 +121,23 @@ pub struct Options {
         env = "ETHREX_ROCKSDB_BLOCK_CACHE_SIZE",
     )]
     pub rocksdb_block_cache_size: usize,
+    #[arg(
+        long = "rocksdb.max-bytes-for-level-base",
+        value_name = "BYTES",
+        default_value_t = ethrex_storage::DEFAULT_ROCKSDB_MAX_BYTES_FOR_LEVEL_BASE,
+        help = "RocksDB max_bytes_for_level_base for state CFs (default 2 GiB). \
+                Use for compaction A/B experiments on trie/flat-KV column families.",
+        long_help = "Sets RocksDB max_bytes_for_level_base on the four state column families \
+                     (account_trie_nodes, storage_trie_nodes, account_flatkeyvalue, \
+                     storage_flatkeyvalue). Other CFs keep the RocksDB 256 MiB default.\n\
+                     \n\
+                     Default 2 GiB matches expected L0 size under memory-pressure flushes. \
+                     Override to A/B compaction write amplification (e.g. 256 MiB vs 2 GiB vs 4 GiB) \
+                     with import-bench. ETHREX_ROCKSDB_MAX_BYTES_FOR_LEVEL_BASE sets the same value.",
+        help_heading = "Storage options",
+        env = "ETHREX_ROCKSDB_MAX_BYTES_FOR_LEVEL_BASE",
+    )]
+    pub rocksdb_max_bytes_for_level_base: u64,
     #[arg(long = "syncmode", default_value = "snap", value_name = "SYNC_MODE", value_parser = utils::parse_sync_mode, help = "The way in which the node will sync its state.", long_help = "Can be either \"full\" or \"snap\" with \"snap\" as default value.", help_heading = "P2P options", env = "ETHREX_SYNCMODE")]
     pub syncmode: SyncMode,
     #[arg(
@@ -540,6 +558,7 @@ impl Default for Options {
             bootnodes: Default::default(),
             datadir: Default::default(),
             rocksdb_block_cache_size: ethrex_storage::DEFAULT_ROCKSDB_BLOCK_CACHE_SIZE_BYTES,
+            rocksdb_max_bytes_for_level_base: ethrex_storage::DEFAULT_ROCKSDB_MAX_BYTES_FOR_LEVEL_BASE,
             syncmode: Default::default(),
             metrics_addr: "0.0.0.0".to_owned(),
             metrics_port: Default::default(),
@@ -779,6 +798,11 @@ impl Subcommand {
                         bal_parallel_trie_enabled: !opts.no_bal_parallel_trie,
                         ..Default::default()
                     },
+                    StoreConfig {
+                        rocksdb_block_cache_size: opts.rocksdb_block_cache_size,
+                        rocksdb_max_bytes_for_level_base: opts.rocksdb_max_bytes_for_level_base,
+                        ..StoreConfig::default()
+                    },
                     export_bal.as_deref(),
                     with_bal.as_deref(),
                 )
@@ -1015,12 +1039,13 @@ pub async fn import_blocks_bench(
     datadir: &Path,
     genesis: Genesis,
     blockchain_opts: BlockchainOptions,
+    store_config: StoreConfig,
     export_bal_path: Option<&str>,
     with_bal_path: Option<&str>,
 ) -> Result<(), ChainError> {
     let start_time = Instant::now();
     init_datadir(datadir);
-    let store = init_store(datadir, genesis).await?;
+    let store = init_store_with_config(datadir, genesis, store_config).await?;
     let blockchain = init_blockchain(store.clone(), blockchain_opts);
     regenerate_head_state(&store, &blockchain).await.unwrap();
     let path_metadata =
@@ -1208,6 +1233,16 @@ pub async fn import_blocks_bench(
         seconds = total_duration.as_secs_f64(),
         "Import completed"
     );
+
+    // Drain RocksDB background compaction before dumping Sum W-Amp stats.
+    // wait_for_persistence_idle only covers ethrex's persist worker.
+    // Real mainnet-scale imports can still compact for several minutes.
+    store.wait_for_persistence_idle().await?;
+    store
+        .wait_for_rocksdb_compaction_settle(Duration::from_secs(600))
+        .await;
+    store.log_rocksdb_state_cf_stats();
+
     Ok(())
 }
 
